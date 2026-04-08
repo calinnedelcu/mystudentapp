@@ -1,0 +1,260 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function hasProfile() {
+      return isSignedIn() &&
+          exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function me() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return hasProfile() && me().role == 'admin';
+    }
+
+    function isParent() {
+      return hasProfile() && me().role == 'parent';
+    }
+
+    function isTeacher() {
+      return hasProfile() && me().role == 'teacher';
+    }
+
+    function isStudent() {
+      return hasProfile() && me().role == 'student';
+    }
+
+    function isGate() {
+      return hasProfile() && me().role == 'gate';
+    }
+
+    function isOwnUser(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isParentOfStudent(studentUid) {
+      return isParent() &&
+          me().children is list &&
+          me().children.hasAny([studentUid]);
+    }
+
+    function isTeacherForClass(classId) {
+      return isTeacher() && me().classId == classId;
+    }
+
+    function onlyOwnInboxFieldsChanged() {
+      return request.resource.data.diff(resource.data).changedKeys().hasOnly([
+        'unreadCount',
+        'inboxLastOpenedAt',
+        'requestsLastOpenedAt',
+        'profilePictureUrl',
+        'photoUrl',
+        'authEmail',
+        'updatedAt',
+        'fcmToken',
+        'twoFactorVerifiedUntil',
+        'passwordChanged',
+      ]);
+    }
+
+    function validLeaveRequestCreate() {
+      return isStudent() &&
+          request.resource.data.keys().hasAll([
+            'studentUid',
+            'studentUsername',
+            'studentName',
+            'classId',
+            'dateText',
+            'timeText',
+            'message',
+            'status',
+            'requestedAt',
+            'reviewedAt',
+            'reviewedByUid',
+            'reviewedByName',
+          ]) &&
+          request.resource.data.studentUid == request.auth.uid &&
+          request.resource.data.classId == me().classId &&
+          request.resource.data.status == 'pending' &&
+          request.resource.data.requestedAt is timestamp &&
+          request.resource.data.reviewedAt == null &&
+          request.resource.data.reviewedByUid == null &&
+          request.resource.data.reviewedByName == null;
+    }
+
+    function validAdminGlobalMessage() {
+      return isAdmin() &&
+          request.resource.data.keys().hasAll([
+            'message',
+            'targetRole',
+            'status',
+            'requestedAt',
+            'reviewedAt',
+            'reviewedByUid',
+            'reviewedByName',
+            'source',
+          ]) &&
+          request.resource.data.source == 'secretariat' &&
+          request.resource.data.status == 'approved' &&
+          request.resource.data.reviewedByUid == request.auth.uid &&
+          request.resource.data.requestedAt is timestamp &&
+          request.resource.data.reviewedAt is timestamp;
+    }
+
+    function validLeaveReviewUpdate() {
+      return resource.data.status == 'pending' &&
+          request.resource.data.diff(resource.data).changedKeys().hasOnly([
+            'status',
+            'reviewedAt',
+            'reviewedByUid',
+            'reviewedByName',
+          ]) &&
+          ['approved', 'rejected'].hasAny([request.resource.data.status]) &&
+          request.resource.data.reviewedByUid == request.auth.uid &&
+          request.resource.data.reviewedAt is timestamp;
+    }
+
+    function canReadLeaveRequest() {
+      return isAdmin() ||
+          (isStudent() && resource.data.studentUid == request.auth.uid) ||
+          isParentOfStudent(resource.data.studentUid) ||
+          isTeacherForClass(resource.data.classId) ||
+          (isParent() && resource.data.targetUid == request.auth.uid);
+    }
+
+    function canReviewLeaveRequest() {
+      return validLeaveReviewUpdate() &&
+          (isAdmin() ||
+              isParentOfStudent(resource.data.studentUid) ||
+              isTeacherForClass(resource.data.classId));
+    }
+
+    function canReadAccessEvent() {
+      return isAdmin() ||
+          isGate() ||
+          (isStudent() && resource.data.userId == request.auth.uid) ||
+          isParentOfStudent(resource.data.userId) ||
+          isTeacherForClass(resource.data.classId);
+    }
+
+    function validSecretariatMessageCreate() {
+      return isAdmin() &&
+          request.resource.data.keys().hasAll([
+            'recipientRole',
+            'recipientUid',
+            'studentUid',
+            'studentName',
+            'classId',
+            'message',
+            'title',
+            'createdAt',
+            'senderUid',
+            'senderName',
+            'broadcastId',
+            'messageType',
+            'source',
+          ]) &&
+          ['student', 'parent', 'teacher'].hasAny([
+            request.resource.data.recipientRole,
+          ]) &&
+          request.resource.data.recipientUid == '' &&
+          request.resource.data.studentUid == '' &&
+          request.resource.data.source == 'secretariat' &&
+          request.resource.data.messageType == 'secretariatGlobal' &&
+          request.resource.data.senderUid == request.auth.uid &&
+          request.resource.data.createdAt is timestamp;
+    }
+
+    function canReadSecretariatMessage() {
+      return isAdmin() ||
+          (isStudent() &&
+              resource.data.recipientRole == 'student' &&
+          (resource.data.recipientUid == request.auth.uid ||
+            resource.data.recipientUid == '')) ||
+          (isParent() &&
+              resource.data.recipientRole == 'parent' &&
+          (resource.data.studentUid == '' ||
+            isParentOfStudent(resource.data.studentUid))) ||
+          (isTeacher() &&
+              resource.data.recipientRole == 'teacher' &&
+          (resource.data.recipientUid == request.auth.uid ||
+            resource.data.recipientUid == ''));
+    }
+
+    function validQrTokenCreate() {
+      return isStudent() &&
+          request.resource.data.keys().hasAll(['userId', 'expiresAt', 'used']) &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.expiresAt is timestamp &&
+          request.resource.data.used == false;
+    }
+
+    match /users/{userId} {
+      // Some legacy accounts may still have inconsistent profile documents
+      // during bootstrap/login. Keep reads available to authenticated users so
+      // the app can resolve and migrate those profiles instead of hanging on a
+      // permission-denied error.
+      allow read: if isSignedIn();
+      allow create: if isAdmin();
+      allow update: if isAdmin() ||
+          (isOwnUser(userId) && onlyOwnInboxFieldsChanged());
+      allow delete: if isAdmin();
+    }
+
+    match /app_settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /classes/{classId} {
+      // Secretariat UI reads class lists directly from Firestore.
+      // Keep writes admin-only, but allow reads for authenticated users.
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /vacancies/{vacancyId} {
+      // Vacancies are managed from the secretariat/admin area.
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /leaveRequests/{requestId} {
+      allow read: if canReadLeaveRequest();
+      allow create: if validLeaveRequestCreate() || validAdminGlobalMessage();
+      allow update: if canReviewLeaveRequest();
+      allow delete: if isAdmin();
+    }
+
+    match /secretariatMessages/{messageId} {
+      allow read: if canReadSecretariatMessage();
+      allow create: if validSecretariatMessageCreate();
+      allow update, delete: if isAdmin();
+    }
+
+    match /accessEvents/{eventId} {
+      allow read: if canReadAccessEvent();
+      allow create: if isGate() || isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /qrTokens/{tokenId} {
+      allow read: if isAdmin() ||
+          (isStudent() && resource.data.userId == request.auth.uid);
+      allow create: if validQrTokenCreate();
+      allow update: if false;
+      allow delete: if isAdmin() ||
+          (isStudent() && resource.data.userId == request.auth.uid);
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
